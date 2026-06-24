@@ -104,6 +104,95 @@ User input
 
 ---
 
+## Context assembly and KV-cache design
+
+Every turn constructs context from two independent layers. The split is
+intentional: the stable layer rarely changes between turns, so the model
+server — local or cloud — can keep it in cache and skip re-processing it.
+The dynamic layer changes on every turn and is built fresh each time.
+
+```
+STABLE PREFIX  (system prompt — cached by the server)
+┌──────────────────────────────────────────────────────────────────┐
+│  Base instructions    tone, tool rules, workflow guidance        │
+│  <project_bible>      characters, world-rules, continuity notes  │
+│  <chapter_summaries>  one prose summary per completed chapter    │
+│  <chapters_full_text> last N completed chapters verbatim ──────┐ │
+└────────────────────────────────────────────────────────────────┼─┘
+              max_full_chapters ─────────────────────────────────┘
+              stable across turns → cache stays warm
+
+DYNAMIC SECTION  (messages array — rebuilt every turn)
+┌──────────────────────────────────────────────────────────────────┐
+│  <active_chapter>        full text of the chapter you are on     │
+│  <agent_memory>          persistent decisions and working facts  │
+│  <conversation_summary>  rolling prose of evicted turns          │
+│  <recent_conversation>   last N verbatim exchanges ────────────┐ │
+│  user message                                                  │ │
+└────────────────────────────────────────────────────────────────┼─┘
+              keep_last_n ──────────────────────────────────────┘
+              changes every turn → never cached
+```
+
+Switching chapters (`/chapter 02_...`) changes the system prompt exactly once
+— on the first turn with the new chapter — then it stabilises. The cache
+re-prefills that one turn and stays warm after that.
+
+### The `max_full_chapters` tradeoff
+
+By default `max_full_chapters = 0`: completed chapters appear in the stable
+prefix as summaries only. This is the right default for most work.
+
+Summaries compress well and are usually sufficient for the model to maintain
+continuity. For detailed line-editing or revision passes where exact prose
+matters, full chapter text in the prefix is better. The tradeoff is
+positional:
+
+- **Working near the beginning.** Few completed chapters exist yet. Full text
+  would be cheap, but there is little back-matter to need it. Summaries are
+  almost always enough here.
+- **Working near the end.** Many long chapters sit behind the active one.
+  Putting them all in the prefix verbatim would overwhelm the context window.
+  Keep `max_full_chapters` at 0–2. Summaries carry the continuity load.
+- **Doing a final revision pass.** You are re-reading finished chapters
+  carefully, comparing voice and argument across sections. Raise
+  `max_full_chapters` to 3–5 and accept the larger prefill cost. You pay
+  it once and the cache stays warm for the whole session.
+
+### Configuration knobs
+
+| Setting | Default | What it controls |
+|---|---|---|
+| `max_full_chapters` | `0` | Full completed chapters in the stable prefix (0 = summaries only) |
+| `keep_last_n` | `6` | Verbatim turns kept in the dynamic messages window |
+| `memory_max_chars` | `4000` | Maximum size of `agent_memory.md` (oldest entries trimmed from top) |
+| `summary_max_chars` | `3000` | Maximum size of the rolling conversation summary |
+| `chat_slot` | `0` | llama.cpp KV-cache slot ID for the main conversation |
+| `summarize_slot` | `1` | llama.cpp KV-cache slot ID for the summariser call |
+
+All of these live in `config.toml` under `[agent]` and `[llm]`. There are
+no hidden knobs between the configuration file and the assembled context.
+`context.py` is the whole thing — readable in one sitting.
+
+### Why hand-crafting the message list matters
+
+A 350-page manuscript has a different cost structure than a chat application.
+Every design choice above — what goes in the stable prefix, what goes in the
+dynamic section, how large each layer is allowed to grow, when to evict and
+summarise — directly affects what the session costs and how well the model
+performs. Those are authorial decisions, not framework defaults.
+
+The harness makes those decisions explicit and adjustable. If the default
+config does not match how you work — if you write in long sessions with dense
+tool use, if your chapters are short and your bible is large, or if you are
+deep in revision rather than first-draft mode — you change two numbers in a
+TOML file and the behaviour changes in a way you can reason about. No
+abstraction layers, no middleware, no surprises.
+
+That is the flexibility we built it for.
+
+---
+
 ## Quick start
 
 ### 1. Install
@@ -263,6 +352,12 @@ Things worth adding when the need is real:
 - [ ] Multi-project support and a cleaner project initialisation flow
 - [ ] Richer examples, including a non-fiction research workflow
 - [ ] Broader test coverage
+- [ ] `/status` command rendering the live context layers — what is in the
+  stable prefix, what is dynamic, and how much of each budget is consumed
+- [ ] Visual bookshelf layout in the startup banner and `/status` output:
+  completed chapters as spines on a shelf, active chapter pulled out and open,
+  so the author sees the shape of the project at a glance rather than a
+  data diagram (v3 aspiration)
 
 The goal is not to build another framework. It is to keep the harness small
 enough that the engineering decisions remain readable — and revisable — by
